@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
-import psycopg2
+# import psycopg2 # Removido, não é mais necessário
 from datetime import datetime
 import time
 import requests
@@ -17,6 +17,13 @@ TOKEN_HEADERS_THORPE = { 'Content-Type': 'application/json' }
 TOKEN_URL_THORPE_ES = 'https://apies.thorpe.com.br/v2/token'
 API_PEDIDOS_BASE_URL_THORPE_ES = 'https://apies.thorpe.com.br/v2/pedidos/'
 AUTH_PAYLOAD_THORPE_ES = { "usuario": "intengagees", "senha": "QE2S0w2o" }
+
+# --- NOVA CONFIGURAÇÃO DA API CONTROLADORIA ---
+API_CONTROLADORIA_URL = "http://209.14.71.180:3000/controladoria-rafael"
+API_CONTROLADORIA_HEADERS = {
+    'Authorization': 'Bearer engage@secure2024',
+    'Content-Type': 'application/json'
+}
 
 # --- Funções Auxiliares da API Thorpe (Extrema - EX) ---
 def obter_token_thorpe_ex():
@@ -137,7 +144,7 @@ def extrair_status_recente_thorpe_generico(dados_pedido_api, id_original_excel_p
         "Data Status Base": data_atual
     }
 
-# --- Nova Função para Buscar Dados Combinados das APIs Thorpe ---
+# --- Função para Buscar Dados Combinados das APIs Thorpe ---
 def buscar_dados_thorpe_combinado_api(lista_ids_originais_excel: list, token_ex_valido: str, token_es_valido: str):
     st.info(f"(API Thorpe Combinado) Consultando {len(lista_ids_originais_excel)} pedido(s)...")
     all_api_data = []
@@ -219,12 +226,13 @@ st.title("Consulta Massiva de Pedidos - Sysemp e Thorpe")
 st.markdown("""
 Esta aplicação permite carregar um arquivo Excel com números de pedidos para buscar informações
 no banco de dados Sysemp e nas APIs Thorpe, unindo os resultados em uma única tabela.
-A consulta à API Thorpe tentará a API Extrema (EX) primeiro. Se o pedido não for encontrado ou não tiver eventos úteis, tentará a API do Espírito Santo (ES).
+A consulta à API tentará a API Extrema (EX) e a API do Espírito Santo (ES).
 O status final indicará a origem da informação (`- EX` ou `- ES`) caso um status específico seja encontrado.
 **Instruções:**
 1.  Prepare um arquivo Excel (`.xlsx` ou `.xls`).
 2.  Na barra lateral, carregue o arquivo e selecione a coluna dos pedidos.
 3.  Clique em "PROCESSAR CONSULTA".
+* Os pedidos da Via Varejo precisam estar no modelo do portal, geralmente terminando em 01, 02 ou 03.
 """) 
 st.sidebar.header("Configurações da Consulta")
 st.sidebar.subheader("1. Carregar Arquivo")
@@ -250,82 +258,64 @@ if uploaded_file:
 st.sidebar.subheader("3. Iniciar Processo")
 process_button = st.sidebar.button("PROCESSAR CONSULTA")
 
-def buscar_dados_no_banco(lista_pedidos_limpos_bd_tuple):
-    db_config = { 'host': "engage.fabricadecodigos.com.br", 'dbname': "engage", 'port': '5433', 'user': "sysemp", 'password': "@@mona!!" }
-    if not lista_pedidos_limpos_bd_tuple:
-        st.warning("(BD) Nenhum ID de pedido (processado) para buscar no banco.")
-        return pd.DataFrame()
-    df_db = pd.DataFrame()
-    conn = None
-    sql_query = """
-    WITH UltimoLancamento AS (
-        SELECT ns.marketplace_pedido, nsol.datahora, oa.descricao AS ANDAMENTO,
-               nsol.observacao AS ANDAMENTO_OBS, nsol.usuario AS USUARIO,
-               ROW_NUMBER() OVER (PARTITION BY ns.marketplace_pedido ORDER BY nsol.datahora DESC) as rn
-        FROM nota_saida ns
-        LEFT JOIN nota_saida_os_log nsol ON ns.id_nota_saida = nsol.id_nota_saida
-        LEFT JOIN os_andamento oa ON nsol.id_os_andamento = oa.id_os_andamento
-        WHERE ns.data_emissao >= '2024-01-01' AND ns.tipo_documento = 'NF' AND nsol.datahora IS NOT NULL 
-    ), LA AS (
-        SELECT marketplace_pedido,
-               CONCAT(TO_CHAR(datahora, 'DD-MM-YYYY HH24:MI:SS'), ' - ', ANDAMENTO ,' - ', ANDAMENTO_OBS ,' - ' , USUARIO) AS ultimo_andamento
-        FROM UltimoLancamento WHERE rn = 1
-    )
-    SELECT
-        pe.descricao AS "|Sysemp| Canal de Venda",
-        tr.razsocial AS "|Sysemp| Transportadora",
-        ns.data_pedido::date AS "|Sysemp| Data do Pedido",
-        ns.data_emissao::date AS "|Sysemp| Data Emissão",
-        ns.data_expedicao::date AS "|Sysemp| Data de Expedição",
-        CASE
-            WHEN LEFT(REPLACE(REPLACE(ns.marketplace_pedido, '_CANC', ''), '_DEVOL', ''), 1) = 'R'
-            THEN SUBSTRING(REPLACE(REPLACE(ns.marketplace_pedido, '_CANC', ''), '_DEVOL', '') FROM 2)
-            ELSE REPLACE(REPLACE(ns.marketplace_pedido, '_CANC', ''), '_DEVOL', '')
-        END AS "N° Pedido Limpo DB",
-        CASE WHEN ns.bloqueada = 'T' AND ns.tipo_documento = 'PD' THEN 'Pedido Bloqueado'
-        WHEN ns.bloqueada = 'F' AND ns.tipo_documento = 'PD' THEN 'Pedido Liberado'
-        ELSE '---'
-        END AS "|Sysemp| Validação Pedido",
-        CASE
-        WHEN ns.tipo_documento = 'PD' THEN 'Pedido'
-        WHEN ns.tipo_documento = 'NF' AND ns.nfe_cstat = '100' THEN 'Nota Fiscal de Venda'
-        WHEN ns.tipo_documento = 'DV' AND ns.nfe_cstat = '100' THEN 'Nota Fiscal de Devolução'
-        WHEN LEFT(ns.marketplace_pedido, 1) = 'R' AND ns.nfe_cstat = '100' THEN 'Nota Fiscal de Reenvio'
-        WHEN ns.nfe_cstat = '101' AND ns.tipo_documento = 'NF' THEN 'Nota Fiscal de Venda Cancelada'
-        WHEN ns.nfe_cstat = '101' AND ns.tipo_documento = 'DV' THEN 'Nota Fiscal de Devolução Cancelada'
-        WHEN ns.tipo_documento IN ('NF', 'DV') AND ns.nfe_cstat NOT IN ('100', '101') THEN 'Nota Fiscal com Erro de Transmissão'
-        ELSE '---'
-        END AS "|Sysemp| Validação Faturamento",
-        LA.ultimo_andamento AS "|Sysemp| Último Andamento"
-    FROM nota_saida ns
-    LEFT JOIN LA ON LA.marketplace_pedido = ns.marketplace_pedido
-    LEFT JOIN plataforma_ecommerce pe on pe.id = ns.id_plataforma
-    LEFT JOIN cliente tr on tr.id_cliente = ns.id_transportadora
-    WHERE CASE
-            WHEN LEFT(REPLACE(REPLACE(ns.marketplace_pedido, '_CANC', ''), '_DEVOL', ''), 1) = 'R'
-            THEN SUBSTRING(REPLACE(REPLACE(ns.marketplace_pedido, '_CANC', ''), '_DEVOL', '') FROM 2)
-            ELSE REPLACE(REPLACE(ns.marketplace_pedido, '_CANC', ''), '_DEVOL', '')
-          END IN %s
-    ORDER BY "N° Pedido Limpo DB";
+
+# --- NOVA FUNÇÃO PARA BUSCAR DADOS DA API DA CONTROLADORIA (COM AJUSTE) ---
+def buscar_dados_controladoria_api(lista_pedidos_limpos_api: list):
     """
+    Busca os dados dos pedidos na API da Controladoria e renomeia as colunas para o padrão do Sysemp.
+    """
+    if not lista_pedidos_limpos_api:
+        st.warning("(API Controladoria) Nenhum ID de pedido para buscar na API.")
+        return pd.DataFrame()
+
+    df_api = pd.DataFrame()
+    payload = {"pedidos": lista_pedidos_limpos_api}
+    
     try:
-        st.info(f"(BD) Conectando e buscando {len(lista_pedidos_limpos_bd_tuple)} IDs processados...")
-        conn = psycopg2.connect(**db_config)
-        df_db = pd.read_sql_query(sql_query, conn, params=(lista_pedidos_limpos_bd_tuple,))
+        st.info(f"(API Controladoria) Conectando e buscando {len(lista_pedidos_limpos_api)} IDs...")
+        response = requests.post(API_CONTROLADORIA_URL, headers=API_CONTROLADORIA_HEADERS, json=payload, timeout=90) # Timeout aumentado
+        response.raise_for_status()
         
-        date_cols_db = ["|Sysemp| Data do Pedido", "|Sysemp| Data Emissão", "|Sysemp| Data de Expedição"]
-        for col_date in date_cols_db:
-            if col_date in df_db.columns:
-                 # Mantém como datetime para ordenação posterior, formata só no final se necessário
-                 df_db[col_date] = pd.to_datetime(df_db[col_date], errors='coerce')
+        dados_api = response.json()
+        if not dados_api: # Verifica se a API retornou uma lista vazia
+            st.warning("(API Controladoria) Nenhum registro encontrado para os IDs consultados.")
+            return pd.DataFrame()
+            
+        df_api = pd.DataFrame(dados_api)
 
-        if df_db.empty: st.warning("(BD) Nenhum registro encontrado para os IDs processados.")
+        # AJUSTE: Mapeia e renomeia as colunas do JSON da API para o padrão esperado pelo script
+        column_mapping = {
+            'canal_venda': '|Sysemp| Canal de Venda',
+            'transportadora': '|Sysemp| Transportadora',
+            'data_pedido': '|Sysemp| Data do Pedido',
+            'data_emissao': '|Sysemp| Data Emissão',
+            'data_expedicao': '|Sysemp| Data de Expedição',
+            'numero_pedido_limpo': 'N° Pedido Limpo DB',  # Chave para o merge
+            'validacao_pedido': '|Sysemp| Validação Pedido',
+            'validacao_faturamento': '|Sysemp| Validação Faturamento',
+            'ultimo_andamento': '|Sysemp| Último Andamento'
+        }
+        df_api.rename(columns=column_mapping, inplace=True)
+        
+        # Garante que as colunas de data sejam do tipo datetime para ordenação
+        date_cols_api = ["|Sysemp| Data do Pedido", "|Sysemp| Data Emissão", "|Sysemp| Data de Expedição"]
+        for col_date in date_cols_api:
+            if col_date in df_api.columns:
+                df_api[col_date] = pd.to_datetime(df_api[col_date], errors='coerce')
 
-    except psycopg2.Error as db_err: st.error(f"(BD) Erro: {db_err}")
-    except Exception as e: st.error(f"(BD) Erro inesperado: {e}")
-    finally:
-        if conn: conn.close()
-    return df_db
+        st.success(f"(API Controladoria) {len(df_api)} registros recebidos com sucesso.")
+
+    except requests.exceptions.HTTPError as http_err:
+        st.error(f"(API Controladoria) Erro HTTP: {http_err} - {response.text}")
+    except requests.exceptions.RequestException as req_err:
+        st.error(f"(API Controladoria) Erro na requisição: {req_err}")
+    except json.JSONDecodeError:
+        st.error(f"(API Controladoria) Erro: A resposta da API não é um JSON válido. Resposta: {response.text}")
+    except Exception as e:
+        st.error(f"(API Controladoria) Erro inesperado: {e}")
+        
+    return df_api
+
 
 # --- Main Processing Block ---
 if process_button:
@@ -339,30 +329,31 @@ if process_button:
             df_base_pedidos = df_base_pedidos[df_base_pedidos["ID Original Excel"] != '']
             df_base_pedidos.drop_duplicates(subset=["ID Original Excel"], inplace=True, keep='first')
 
-            df_base_pedidos["ID_para_Consulta_BD"] = df_base_pedidos["ID Original Excel"].apply(preparar_id_para_bd).str.upper()
+            df_base_pedidos["ID_para_Consulta_API"] = df_base_pedidos["ID Original Excel"].apply(preparar_id_para_bd).str.upper()
             
             if df_base_pedidos.empty:
                 st.warning("Nenhum pedido válido extraído do Excel.")
             else:
                 st.success(f"Extraídos {len(df_base_pedidos)} pedidos únicos do Excel.")
                 
-                lista_ids_originais_api = df_base_pedidos["ID Original Excel"].unique().tolist()
-                lista_ids_limpos_bd_sql_tuple = tuple(df_base_pedidos["ID_para_Consulta_BD"].unique().tolist())
+                lista_ids_originais_api_thorpe = df_base_pedidos["ID Original Excel"].unique().tolist()
+                lista_ids_limpos_api_controladoria = df_base_pedidos["ID_para_Consulta_API"].unique().tolist()
 
-                df_resultados_db = pd.DataFrame()
-                if lista_ids_limpos_bd_sql_tuple:
-                    df_resultados_db = buscar_dados_no_banco(lista_ids_limpos_bd_sql_tuple)
-                    if not df_resultados_db.empty and "N° Pedido Limpo DB" in df_resultados_db.columns:
-                        df_resultados_db["N° Pedido Limpo DB"] = df_resultados_db["N° Pedido Limpo DB"].astype(str).str.upper()
+                df_resultados_sysemp_api = pd.DataFrame()
+                if lista_ids_limpos_api_controladoria:
+                    # Chama a função da API
+                    df_resultados_sysemp_api = buscar_dados_controladoria_api(lista_ids_limpos_api_controladoria)
+                    if not df_resultados_sysemp_api.empty and "N° Pedido Limpo DB" in df_resultados_sysemp_api.columns:
+                        df_resultados_sysemp_api["N° Pedido Limpo DB"] = df_resultados_sysemp_api["N° Pedido Limpo DB"].astype(str).str.upper()
                 else:
-                    st.info("(BD) Nenhum ID válido para consultar o banco de dados após o tratamento de sufixos.")
+                    st.info("(API Controladoria) Nenhum ID válido para consultar a API após o tratamento de sufixos.")
 
                 token_ex_valido = obter_token_thorpe_ex_cached()
                 token_es_valido = obter_token_thorpe_es_cached()
 
                 df_resultados_thorpe_api = pd.DataFrame()
-                if (token_ex_valido or token_es_valido) and lista_ids_originais_api:
-                    df_resultados_thorpe_api = buscar_dados_thorpe_combinado_api(lista_ids_originais_api, token_ex_valido, token_es_valido)
+                if (token_ex_valido or token_es_valido) and lista_ids_originais_api_thorpe:
+                    df_resultados_thorpe_api = buscar_dados_thorpe_combinado_api(lista_ids_originais_api_thorpe, token_ex_valido, token_es_valido)
                     if not df_resultados_thorpe_api.empty and "ID Original Excel" in df_resultados_thorpe_api.columns:
                         df_resultados_thorpe_api["ID Original Excel"] = df_resultados_thorpe_api["ID Original Excel"].astype(str).str.upper()
                 elif not (token_ex_valido or token_es_valido):
@@ -370,20 +361,21 @@ if process_button:
                 
                 df_final_combinado = df_base_pedidos.copy()
 
-                cols_db_esperadas = [
+                cols_sysemp_api_esperadas = [
                     "|Sysemp| Canal de Venda", "|Sysemp| Transportadora",
                     "|Sysemp| Data do Pedido", "|Sysemp| Data Emissão", "|Sysemp| Data de Expedição",
                     "|Sysemp| Validação Pedido", "|Sysemp| Validação Faturamento", "|Sysemp| Último Andamento"
                 ]
                 cols_api_thorpe_combinadas = ["Status Thorpe", "Data Status Thorpe"]
 
-                if not df_resultados_db.empty and "N° Pedido Limpo DB" in df_resultados_db.columns:
-                    df_final_combinado = pd.merge(df_final_combinado, df_resultados_db,
-                                                  left_on="ID_para_Consulta_BD", right_on="N° Pedido Limpo DB", how="left")
+                if not df_resultados_sysemp_api.empty and "N° Pedido Limpo DB" in df_resultados_sysemp_api.columns:
+                    # O merge agora pode criar múltiplas linhas por pedido original, o que está correto com base na resposta da API
+                    df_final_combinado = pd.merge(df_final_combinado, df_resultados_sysemp_api,
+                                                  left_on="ID_para_Consulta_API", right_on="N° Pedido Limpo DB", how="left")
                     if "N° Pedido Limpo DB" in df_final_combinado.columns:
                         del df_final_combinado["N° Pedido Limpo DB"]
                 else: 
-                    for col_db in cols_db_esperadas:
+                    for col_db in cols_sysemp_api_esperadas:
                         if col_db not in df_final_combinado.columns: df_final_combinado[col_db] = pd.NaT if "Data" in col_db else "---"
                 
                 if not df_resultados_thorpe_api.empty and "ID Original Excel" in df_resultados_thorpe_api.columns:
@@ -395,8 +387,8 @@ if process_button:
                 
                 df_final_combinado.rename(columns={"ID Original Excel": "|Sysemp| N° do Pedido"}, inplace=True)
                 
-                if "ID_para_Consulta_BD" in df_final_combinado.columns:
-                    del df_final_combinado["ID_para_Consulta_BD"]
+                if "ID_para_Consulta_API" in df_final_combinado.columns:
+                    del df_final_combinado["ID_para_Consulta_API"]
 
                 colunas_finais_ordenadas = [
                     "|Sysemp| N° do Pedido", "|Sysemp| Canal de Venda", "|Sysemp| Transportadora",
@@ -410,15 +402,9 @@ if process_button:
                 for col in df_final_display.columns:
                     if df_final_display[col].dtype == 'object':
                         df_final_display[col].fillna("---", inplace=True)
-                # Para colunas de data, NaT é o preenchimento natural para "não data"
-                # Elas serão formatadas para string '---' ou data formatada mais tarde se necessário para exibição específica
-
+                
                 # --- INÍCIO DA ORDENAÇÃO ---
                 if not df_final_display.empty and '|Sysemp| Data Emissão' in df_final_display.columns:
-                    # A coluna '|Sysemp| Data Emissão' já deve ser datetime por causa da mudança em buscar_dados_no_banco
-                    # Se ainda for string ou object por algum motivo, converter aqui:
-                    # df_final_display['|Sysemp| Data Emissão'] = pd.to_datetime(df_final_display['|Sysemp| Data Emissão'], format='%d/%m/%Y', errors='coerce')
-                    
                     df_final_display.sort_values(
                         by=['|Sysemp| N° do Pedido', '|Sysemp| Data Emissão'],
                         ascending=[True, True], 
@@ -431,10 +417,9 @@ if process_button:
                 date_cols_to_format_for_display = ["|Sysemp| Data do Pedido", "|Sysemp| Data Emissão", "|Sysemp| Data de Expedição"]
                 for col_date in date_cols_to_format_for_display:
                     if col_date in df_final_display.columns:
-                        # Verificar se a coluna é do tipo datetime antes de tentar formatar
                         if pd.api.types.is_datetime64_any_dtype(df_final_display[col_date]):
                             df_final_display[col_date] = df_final_display[col_date].dt.strftime('%d/%m/%Y').fillna("---")
-                        else: # Se não for datetime (ex: já era string ou "---"), apenas garanta que NaNs/NaTs sejam "---"
+                        else: 
                             df_final_display[col_date] = df_final_display[col_date].astype(str).replace('NaT', '---').fillna("---")
 
 
@@ -485,13 +470,11 @@ if process_button:
                     
                     @st.cache_data
                     def convert_df_to_excel(df_to_convert):
-                        # Cópia para evitar modificar o df_final_display se ele for usado depois
                         df_excel = df_to_convert.copy()
-                        # Formatar datas para Excel, caso ainda sejam datetime
-                        for col_date_excel in date_cols_to_format_for_display: # Reutiliza a lista de colunas de data
+                        for col_date_excel in date_cols_to_format_for_display:
                             if col_date_excel in df_excel.columns and pd.api.types.is_datetime64_any_dtype(df_excel[col_date_excel]):
                                 df_excel[col_date_excel] = df_excel[col_date_excel].dt.strftime('%d/%m/%Y')
-                        df_excel.fillna("---", inplace=True) # Garantir que NaT ou NaN restantes virem "---"
+                        df_excel.fillna("---", inplace=True)
 
                         output_buffer = io.BytesIO()
                         with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
@@ -503,7 +486,7 @@ if process_button:
                     filename = f"resultados_combinados_{current_date_str}.xlsx"
                     st.download_button(label="Baixar Resultado .xlsx", data=excel_data, file_name=filename, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
                 else:
-                    if lista_ids_limpos_bd_sql_tuple or lista_ids_originais_api : st.info("Nenhum resultado final para exibir após os merges.")
+                    if lista_ids_limpos_api_controladoria or lista_ids_originais_api_thorpe : st.info("Nenhum resultado final para exibir após os merges.")
 
         except Exception as e:
             st.error(f"Ocorreu um erro geral no processamento: {e}")
